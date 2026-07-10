@@ -1,0 +1,14 @@
+# Reports
+*.html
+*.csv
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Editors & IDEs
+.vscode/
+.idea/
+*.suo
+*.user
+*.sln.docstates
