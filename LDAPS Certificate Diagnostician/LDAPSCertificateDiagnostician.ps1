@@ -1,22 +1,21 @@
 ﻿<#
 .SYNOPSIS
-    Diagnostique les certificats LDAPS, extrait le Thumbprint et les SAN.
+    Diagnostique les certificats LDAPS sur toutes les IP d'un nom DNS (Round-Robin).
 .DESCRIPTION
-    Ce script se connecte a un serveur via LDAPS (port 636), valide la chaine de 
-    confiance TLS, puis extrait l'empreinte numerique (Thumbprint) et les noms 
-    alternatifs (SAN) du certificat sans necessiter d'outils tiers (comme OpenSSL).
-    Gere le rebond (Round-Robin) pour tester plusieurs IPs associees au meme nom DNS.
+    Ce script resout un nom DNS, liste toutes les adresses IPv4 associees, puis se
+    connecte individuellement a chaque adresse IP sur le port LDAPS (636). Il valide 
+    la chaine de confiance TLS, extrait l'empreinte numerique (Thumbprint) et les noms 
+    alternatifs (SAN) de chaque controleur de domaine.
 .PARAMETER Server
-    Le nom de domaine complet (FQDN) du serveur LDAPS a tester.
+    Le nom de domaine complet (FQDN) du serveur LDAPS ou de la zone Round-Robin a tester.
 .PARAMETER Port
     Le port LDAPS (par defaut : 636).
 .PARAMETER Loop
     Si specifie, force l'execution en boucle automatique (utile pour les scripts automatises).
 .EXAMPLE
     .\Test-LdapsCertificate.ps1
-    (Execution interactive avec invite de saisie et option de rejeu)
 .EXAMPLE
-    .\Test-LdapsCertificate.ps1 -Server "dc01.contoso.local" -Port 636
+    .\Test-LdapsCertificate.ps1 -Server "themartins.lan" -Port 636
 #>
 
 [CmdletBinding()]
@@ -42,77 +41,88 @@ if ([string]::IsNullOrWhiteSpace($Server)) {
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
 
 do {
-    $TcpClient = $null
-    $global:tlsErrors = $null
-    
+    # 3. Resolution DNS globale
+    Write-Host "`n[+] Resolution DNS pour $Server..." -ForegroundColor Gray
     try {
-        # Resolution DNS pour afficher l'IP ciblee (tres utile en cas de Round-Robin)
-        Write-Host "`nResolution DNS pour $Server..." -ForegroundColor Gray
         $TargetIPs = [System.Net.Dns]::GetHostAddresses($Server) | Where-Object { $_.AddressFamily -eq 'InterNetwork' }
-        if ($TargetIPs) {
-            Write-Host "IPs trouvees pour ce nom : $($TargetIPs -join ', ')" -ForegroundColor Gray
+        if (-not $TargetIPs) {
+            Write-Error "Aucune adresse IPv4 trouvee pour le nom : $Server"
+            break
         }
-
-        Write-Host "Connexion a ${Server}:${Port}..." -ForegroundColor Yellow
-        
-        # 3. Connexion TCP et initialisation du flux SSL/TLS
-        $TcpClient = New-Object System.Net.Sockets.TcpClient($Server, $Port)
-        
-        # Callback pour intercepter les erreurs de validation du certificat sans bloquer le script
-        $ValidationCallback = { 
-            param($sender, $cert, $chain, $errors) 
-            $global:tlsErrors = $errors
-            return $true 
-        }
-        
-        $SslStream = New-Object System.Net.Security.SslStream($TcpClient.GetStream(), $true, $ValidationCallback)
-        $SslStream.AuthenticateAsClient($Server)
-        
-        # 4. Extraction et analyse du certificat
-        if ($SslStream.RemoteCertificate) {
-            $Cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]$SslStream.RemoteCertificate
-
-            # --- Affichage des resultats ---
-            Write-Host "=========================================" -ForegroundColor Gray
-            Write-Host "--- VALIDATION ---" -ForegroundColor Cyan
-            
-            if ($global:tlsErrors -eq "None") { 
-                Write-Host "Connexion TLS : Valide (Certificat de confiance)" -ForegroundColor Green 
-            } else { 
-                Write-Host "Erreur de validation : $global:tlsErrors" -ForegroundColor Red 
-            }
-
-            Write-Host "`n--- THUMBPRINT (SHA1) ---" -ForegroundColor Cyan
-            Write-Host $Cert.Thumbprint
-
-            Write-Host "`n--- SAN (Subject Alternative Names) ---" -ForegroundColor Cyan
-            # Utilisation de l'OID universel (2.5.29.17) pour assurer la compatibilite toutes langues (FR/EN)
-            $SanExtension = $Cert.Extensions | Where-Object { $_.Oid.Value -eq "2.5.29.17" }
-            if ($SanExtension) {
-                Write-Host ($SanExtension.Format($true))
-            } else {
-                Write-Host "Aucun champ SAN trouve dans ce certificat." -ForegroundColor Yellow
-            }
-            Write-Host "=========================================" -ForegroundColor Gray
-        } else {
-            Write-Error "Impossible de recuperer le certificat du serveur distant."
-        }
+        Write-Host "[*] $($TargetIPs.Count) adresse(s) IP trouvee(s) : $($TargetIPs -join ', ')" -ForegroundColor Gray
     }
     catch {
-        Write-Error "Echec de la connexion : $_"
+        Write-Error "Impossible de resoudre le nom DNS : $_"
+        break
     }
-    finally {
-        if ($TcpClient) { 
-            $TcpClient.Close() 
+
+    # 4. Parcours de TOUTES les adresses IP trouvees
+    foreach ($IP in $TargetIPs) {
+        $TcpClient = $null
+        $global:tlsErrors = $null
+        
+        Write-Host "`n--------------------------------------------------" -ForegroundColor DarkGray
+        Write-Host " TEST CIBLE : $Server à l'adresse [$IP]" -ForegroundColor Yellow
+        Write-Host "--------------------------------------------------" -ForegroundColor DarkGray
+        
+        try {
+            # Connexion TCP ciblee sur l'IP specifique
+            Write-Host "-> Connexion TCP vers $IP sur le port $Port..." -ForegroundColor Gray
+            $TcpClient = New-Object System.Net.Sockets.TcpClient
+            $TcpClient.Connect($IP, $Port)
+            
+            # Callback pour intercepter les erreurs sans bloquer le script
+            $ValidationCallback = { 
+                param($sender, $cert, $chain, $errors) 
+                $global:tlsErrors = $errors
+                return $true 
+            }
+            
+            # Initialisation SSL/TLS : On passe l'IP pour le flux, mais le Nom DNS ($Server) 
+            # pour que la verification du certificat et le SNI restent valides.
+            $SslStream = New-Object System.Net.Security.SslStream($TcpClient.GetStream(), $true, $ValidationCallback)
+            $SslStream.AuthenticateAsClient($Server)
+            
+            if ($SslStream.RemoteCertificate) {
+                $Cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]$SslStream.RemoteCertificate
+
+                # --- Affichage des resultats pour cette IP ---
+                Write-Host "--- VALIDATION ---" -ForegroundColor Cyan
+                if ($global:tlsErrors -eq "None") { 
+                    Write-Host "Connexion TLS : Valide (Certificat de confiance)" -ForegroundColor Green 
+                } else { 
+                    Write-Host "Erreur de validation : $global:tlsErrors" -ForegroundColor Red 
+                }
+
+                Write-Host "`n--- THUMBPRINT (SHA1) ---" -ForegroundColor Cyan
+                Write-Host $Cert.Thumbprint
+
+                Write-Host "`n--- SAN (Subject Alternative Names) ---" -ForegroundColor Cyan
+                $SanExtension = $Cert.Extensions | Where-Object { $_.Oid.Value -eq "2.5.29.17" }
+                if ($SanExtension) {
+                    Write-Host ($SanExtension.Format($true))
+                } else {
+                    Write-Host "Aucun champ SAN trouve dans ce certificat." -ForegroundColor Yellow
+                }
+            } else {
+                Write-Error "[$IP] Impossible de recuperer le certificat du serveur distant."
+            }
+        }
+        catch {
+            Write-Error "[$IP] Echec de la connexion ou de la négociation TLS : $_"
+        }
+        finally {
+            if ($TcpClient) { $TcpClient.Close() }
         }
     }
 
-    # 5. Gestion du Round-Robin / Rejeu (Par defaut : OUI)
+    Write-Host "`n==================================================" -ForegroundColor DarkGray
+    Write-Host "Fin de l'analyse pour toutes les adresses IP." -ForegroundColor Gray
+    Write-Host "==================================================" -ForegroundColor DarkGray
+
+    # 5. Gestion de la boucle globale de rejeu
     if (-not $Loop) {
-        $Response = Read-Host "`nVoulez-vous rejouer le test sur ce nom ? [O/N] (Par defaut: O)"
-        
-        # Si l'utilisateur tape Entree (vide), ou n'importe quoi commençant par O/Y -> On rejoue.
-        # Si l'utilisateur tape explicitement N/n -> On s'arrete.
+        $Response = Read-Host "`nVoulez-vous relancer un scan complet sur ce nom ? [O/N] (Par defaut: O)"
         if ([string]::IsNullOrWhiteSpace($Response)) {
             $PlayAgain = $true
         } else {
